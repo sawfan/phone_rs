@@ -1,0 +1,13 @@
+[package]
+name = "phone-speaker"
+version = "0.1.0"
+edition = "2024"
+description = "Play phone's sound through this machine's audio output (cpal)."
+
+# Spelled out rather than inherited so the crate can also be a member of a
+# host workspace (Mnemosyne). On Linux, cpal needs the ALSA development
+# headers (libasound2-dev); PipeWire and PulseAudio are reached through
+# ALSA's default device.
+[dependencies]
+cpal = "0.18.2"
+phone-core = { path = "../phone-core" }

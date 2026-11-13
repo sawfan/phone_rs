@@ -1,6 +1,13 @@
-[package]
-name = "phone"
+[workspace]
+resolver = "3"
+members = [
+    "crates/phone-core",
+    "crates/phone-cli",
+    "crates/phone-mcp",
+    "crates/phone-leptos",
+    "crates/phone-speaker",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]

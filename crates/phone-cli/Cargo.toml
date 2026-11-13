@@ -1,0 +1,27 @@
+[package]
+name = "phone-cli"
+version = "0.1.0"
+edition = "2024"
+description = "The `phone` command: render tones to WAV files."
+
+[lib]
+name = "phone_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "phone"
+path = "src/main.rs"
+
+# Spelled out rather than inherited so the crate can also be a member of a
+# host workspace (Mnemosyne).
+[dependencies]
+phone-core = { path = "../phone-core" }
+phone-speaker = { path = "../phone-speaker", optional = true }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
+
+[features]
+default = []
+# `tones --play` and `devices`: this machine's audio output through cpal
+# (on Linux, needs the ALSA development headers).
+speaker = ["dep:phone-speaker"]

@@ -1,0 +1,19 @@
+[package]
+name = "phone-leptos"
+version = "0.1.0"
+edition = "2024"
+description = "Browser playback for phone: the page's one Web Audio context, and rendered clips played through it."
+
+# Spelled out rather than inherited so the crate can also be a member of a
+# host workspace (Mnemosyne).
+#
+# No Leptos dependency yet: playback is plain Web Audio through web-sys, so
+# any Leptos component (or other browser code) can call it. The bindings
+# compile on every target; calling them outside a browser is a programming
+# error, so server-rendered code must only call them from event handlers.
+[dependencies]
+js-sys = "0.3"
+phone-core = { path = "../phone-core" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["AudioBuffer", "AudioBufferSourceNode", "AudioContext", "AudioContextState", "AudioDestinationNode", "AudioNode", "AudioScheduledSourceNode", "BaseAudioContext"] }

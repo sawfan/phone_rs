@@ -1,0 +1,22 @@
+[package]
+name = "phone-core"
+version = "0.1.0"
+edition = "2024"
+description = "Sound synthesis for Mnemosyne: sample-producing voices and instruments, independent of where the sound is played."
+
+[lib]
+name = "phone_core"
+
+# Dependencies are spelled out rather than inherited from the workspace so the
+# crate can also be a member of a host workspace (Mnemosyne).
+[dependencies]
+# Oscillators and filters for instruments. Default features (sound-file
+# reading through symphonia, FFT convolution) are not needed.
+fundsp = { version = "0.23", default-features = false, features = ["std"] }
+schemars = { version = "1.0", optional = true }
+serde = { version = "1.0.219", features = ["derive"] }
+
+[features]
+default = []
+# JSON Schema derives for MCP result types.
+schema = ["dep:schemars"]
