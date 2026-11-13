@@ -4,11 +4,15 @@
 //! them through [`run`], and a host (Mnemosyne) runs the same commands
 //! under its own name.
 //!
-//! With the `speaker` feature, `tones --play` plays through this machine's
-//! audio output and `devices` lists output devices.
+//! With the `speaker` feature, `tones --play` and `say --play` play
+//! through this machine's audio output (speech as it arrives from the
+//! backend) and `devices` lists output devices. `say` and `tts` use the
+//! text-to-speech backend: from `PHONE_TTS_*` variables in [`execute`], or
+//! the host's in [`execute_with`].
 
 use phone_core::dto::{self, Existing};
 use phone_core::{Pcm, Sound, SoundChanges, tone};
+use phone_tts::{SpeakOptions, Spoken, Tts};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -31,11 +35,31 @@ usage: phone <command>
                            device id from `devices`, or a name or part of
                            one that only that device has (default: the
                            default output)
+  say <text>... (--out <file.wav> | --play [--device <name>])
+      [--voice <voice>] [--speed <0.25-4>]
+                           say text with the text-to-speech backend: to a
+                           WAV file, or aloud as the speech arrives (both,
+                           if both are given); --voice is one the backend
+                           knows (default: its configured voice)
+  tts                      the configured text-to-speech backend
   devices                  the output devices (JSON)
   presets                  the presets and waveforms (JSON)
   help                     this message
 
-  --play and devices need a build with the `speaker` feature.";
+  --play and devices need a build with the `speaker` feature.
+
+text-to-speech configuration (environment):
+  PHONE_TTS_BASE_URL       the speech server, such as http://127.0.0.1:8880
+                           (required for say and tts); it must implement
+                           the OpenAI speech API (Kokoro-FastAPI,
+                           openedai-speech, LocalAI, OpenAI)
+  PHONE_TTS_MODEL          model name (default tts-1)
+  PHONE_TTS_VOICE          default voice (default alloy)
+  PHONE_TTS_FORMAT         wav (default) or pcm
+  PHONE_TTS_SAMPLE_RATE    the rate of pcm (default 24000)
+  PHONE_TTS_PATH           request path (default /v1/audio/speech)
+  PHONE_TTS_API_KEY_ENV    name of the variable holding a bearer token
+  PHONE_TTS_TIMEOUT_SECONDS  request timeout (default 120)";
 
 const TONES_USAGE: &str = "usage: phone tones <hz>... (--out <file.wav> | --play [--device <name>]) [--chord] [--step <seconds>] [--duration <seconds>] [--preset <id>] [--waveform <id>] [--attack <s>] [--decay <s>] [--sustain <0-1>] [--release <s>] [--cutoff <hz>] [--volume <0-1>] [--rate <hz>]";
 
@@ -74,13 +98,33 @@ pub struct TonesRequest {
     pub destination: Destination,
 }
 
+/// What `say` says, and where.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SayRequest {
+    pub text: String,
+    pub options: SpeakOptions,
+    pub destination: Destination,
+}
+
 /// A parsed command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help,
     Tones(TonesRequest),
+    Say(SayRequest),
+    Tts,
     Devices,
     Presets,
+}
+
+/// What `say` did.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SayOutcome {
+    pub spoken: Spoken,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub written: Option<dto::RenderedFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub played: Option<PlayedInfo>,
 }
 
 /// What `tones` did: the file written (its fields at the top level) and
@@ -100,6 +144,20 @@ pub struct PlayedInfo {
     /// The device's sample rate, which the sound was resampled to.
     pub sample_rate: u32,
     pub seconds: f64,
+    /// Silence while waiting for streamed sound that came late.
+    pub gap_seconds: f64,
+}
+
+#[cfg(feature = "speaker")]
+impl From<phone_speaker::Played> for PlayedInfo {
+    fn from(played: phone_speaker::Played) -> Self {
+        PlayedInfo {
+            device: played.device,
+            sample_rate: played.sample_rate,
+            seconds: played.seconds,
+            gap_seconds: played.gap_seconds,
+        }
+    }
 }
 
 /// An output device.
@@ -118,12 +176,7 @@ const NO_SPEAKER: &str = "this phone was built without audio output; rebuild wit
 pub fn play(pcm: &Pcm, device: Option<&str>) -> Result<PlayedInfo, String> {
     #[cfg(feature = "speaker")]
     {
-        let played = phone_speaker::play(pcm, device)?;
-        Ok(PlayedInfo {
-            device: played.device,
-            sample_rate: played.sample_rate,
-            seconds: played.seconds,
-        })
+        Ok(phone_speaker::play(pcm, device)?.into())
     }
     #[cfg(not(feature = "speaker"))]
     {
@@ -253,6 +306,57 @@ fn parse_tones(args: &[String]) -> Result<TonesRequest, String> {
     })
 }
 
+const SAY_USAGE: &str = "usage: phone say <text>... (--out <file.wav> | --play [--device <name>]) [--voice <voice>] [--speed <0.25-4>]";
+
+fn parse_say(args: &[String]) -> Result<SayRequest, String> {
+    let mut words = Vec::new();
+    let mut options = SpeakOptions::default();
+    let mut out = None;
+    let mut play = false;
+    let mut device = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next()
+                .ok_or_else(|| format!("{arg} needs a value\n{SAY_USAGE}"))
+        };
+        match arg.as_str() {
+            "--out" => out = Some(value()?.clone()),
+            "--play" => play = true,
+            "--device" => device = Some(value()?.clone()),
+            "--voice" => options.voice = Some(value()?.clone()),
+            "--speed" => {
+                let speed = value()?;
+                options.speed =
+                    Some(speed.parse().map_err(|_| {
+                        format!("--speed needs a number, not {speed:?}\n{SAY_USAGE}")
+                    })?);
+            }
+            flag if flag.starts_with("--") => {
+                return Err(format!("unknown option {flag}\n{SAY_USAGE}"));
+            }
+            word => words.push(word),
+        }
+    }
+    let text = words.join(" ");
+    phone_tts::validate_text(&text).map_err(|error| format!("say: {error}\n{SAY_USAGE}"))?;
+    options.validate()?;
+    if device.is_some() && !play {
+        return Err(format!("say: --device is for --play\n{SAY_USAGE}"));
+    }
+    if out.is_none() && !play {
+        return Err(format!("say: give --out, --play, or both\n{SAY_USAGE}"));
+    }
+    Ok(SayRequest {
+        text,
+        options,
+        destination: Destination {
+            out,
+            play: play.then_some(device),
+        },
+    })
+}
+
 impl Command {
     pub fn parse(args: &[String]) -> Result<Self, String> {
         let Some((command, rest)) = args.split_first() else {
@@ -266,6 +370,9 @@ impl Command {
             }
             "devices" => Ok(Self::Devices),
             "tones" => parse_tones(rest).map(Self::Tones),
+            "say" => parse_say(rest).map(Self::Say),
+            "tts" if rest.is_empty() => Ok(Self::Tts),
+            "tts" => Err(format!("unexpected arguments: {}", rest.join(" "))),
             other => Err(format!("unknown command {other:?}\n{USAGE}")),
         }
     }
@@ -290,13 +397,124 @@ pub fn render_tones(request: &TonesRequest) -> Result<TonesOutcome, String> {
     Ok(TonesOutcome { written, played })
 }
 
-pub fn execute(command: Command) -> Result<Output, String> {
+/// Says a [`SayRequest`] with `tts`. Played speech streams: it starts
+/// once a little has arrived. A file, if asked for, is written (replacing
+/// an existing one) after the speech has ended.
+pub fn say(tts: &Tts, request: &SayRequest) -> Result<SayOutcome, String> {
+    let SayRequest {
+        text,
+        options,
+        destination,
+    } = request;
+    let (spoken, pcm, played) = match &destination.play {
+        None => {
+            let pcm = tts.speak_to_pcm(text, options)?;
+            let spoken = Spoken {
+                sample_rate: pcm.sample_rate,
+                seconds: pcm.seconds(),
+                stopped: false,
+            };
+            (spoken, Some(pcm), None)
+        }
+        Some(device) => {
+            let (spoken, pcm, played) = say_aloud(
+                tts,
+                text,
+                options,
+                device.as_deref(),
+                destination.out.is_some(),
+            )?;
+            (spoken, pcm, Some(played))
+        }
+    };
+    let written = match (&destination.out, pcm) {
+        (Some(out), Some(pcm)) => Some(dto::write_wav(&pcm, out, Existing::Replace)?),
+        _ => None,
+    };
+    Ok(SayOutcome {
+        spoken,
+        written,
+        played,
+    })
+}
+
+/// Plays speech on `device` as it arrives, keeping a copy when `keep`.
+#[cfg(feature = "speaker")]
+fn say_aloud(
+    tts: &Tts,
+    text: &str,
+    options: &SpeakOptions,
+    device: Option<&str>,
+    keep: bool,
+) -> Result<(Spoken, Option<Pcm>, PlayedInfo), String> {
+    use std::ops::ControlFlow;
+
+    // Checked before the device opens.
+    phone_tts::validate_text(text)?;
+    options.validate()?;
+    let mut output = phone_speaker::Output::open(device)?;
+    let mut kept = Vec::new();
+    let mut failure = None;
+    let spoken = tts.speak(text, options, &mut |pcm| {
+        if keep {
+            kept.extend_from_slice(&pcm.samples);
+        }
+        match output.push(&pcm) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => {
+                failure = Some(error);
+                ControlFlow::Break(())
+            }
+        }
+    })?;
+    if let Some(error) = failure {
+        return Err(error.into());
+    }
+    let played = output.finish()?;
+    let pcm = keep.then_some(Pcm {
+        sample_rate: spoken.sample_rate,
+        samples: kept,
+    });
+    Ok((spoken, pcm, played.into()))
+}
+
+#[cfg(not(feature = "speaker"))]
+fn say_aloud(
+    _tts: &Tts,
+    _text: &str,
+    _options: &SpeakOptions,
+    _device: Option<&str>,
+    _keep: bool,
+) -> Result<(Spoken, Option<Pcm>, PlayedInfo), String> {
+    Err(NO_SPEAKER.to_string())
+}
+
+/// Runs `command`, building the text-to-speech backend with `tts` when the
+/// command needs one (so commands that do not work unconfigured).
+pub fn execute_with(
+    command: Command,
+    tts: &dyn Fn() -> Result<Tts, String>,
+) -> Result<Output, String> {
     match command {
         Command::Help => Ok(Output::Text(USAGE.to_string())),
         Command::Presets => Output::json(dto::catalog()),
         Command::Devices => devices(),
         Command::Tones(request) => Output::json(render_tones(&request)?),
+        Command::Say(request) => {
+            // Say so before asking the backend for speech.
+            #[cfg(not(feature = "speaker"))]
+            if request.destination.play.is_some() {
+                return Err(NO_SPEAKER.to_string());
+            }
+            Output::json(say(&tts()?, &request)?)
+        }
+        Command::Tts => Output::json(tts()?.info()),
     }
+}
+
+/// Runs `command` with the backend from `PHONE_TTS_*` variables.
+pub fn execute(command: Command) -> Result<Output, String> {
+    execute_with(command, &|| Tts::from_env().map_err(String::from))
 }
 
 /// Parses and runs `args`, as the `phone` binary does.
@@ -359,6 +577,102 @@ mod tests {
         assert_eq!(Command::parse(&args(&["devices"])), Ok(Command::Devices));
     }
 
+    /// A backend that says a fixed 0.25 s of a 1000 Hz sine at 8 kHz, in
+    /// pieces.
+    struct Fake;
+
+    impl phone_tts::TextToSpeech for Fake {
+        fn info(&self) -> phone_tts::BackendInfo {
+            phone_tts::BackendInfo {
+                kind: "fake".to_string(),
+                model: "m".to_string(),
+                voice: "v".to_string(),
+                endpoint: None,
+            }
+        }
+
+        fn speak(
+            &self,
+            text: &str,
+            options: &SpeakOptions,
+            chunk: &mut dyn FnMut(Pcm) -> std::ops::ControlFlow<()>,
+        ) -> Result<Spoken, phone_tts::TtsError> {
+            phone_tts::validate_text(text)?;
+            options.validate()?;
+            let samples: Vec<f32> = (0..2_000)
+                .map(|n| (n as f32 * std::f32::consts::TAU / 8.0).sin() * 0.5)
+                .collect();
+            for piece in samples.chunks(800) {
+                let _ = chunk(Pcm {
+                    sample_rate: 8_000,
+                    samples: piece.to_vec(),
+                });
+            }
+            Ok(Spoken {
+                sample_rate: 8_000,
+                seconds: 0.25,
+                stopped: false,
+            })
+        }
+    }
+
+    fn fake() -> Result<Tts, String> {
+        Ok(Tts::new(Box::new(Fake)))
+    }
+
+    #[test]
+    fn parses_say() {
+        let Command::Say(request) = Command::parse(&args(&[
+            "say",
+            "Hello,",
+            "Mnemosyne.",
+            "--voice",
+            "af_heart",
+            "--speed",
+            "1.2",
+            "--out",
+            "a.wav",
+        ]))
+        .unwrap() else {
+            panic!("expected say");
+        };
+        assert_eq!(request.text, "Hello, Mnemosyne.");
+        assert_eq!(request.options.voice.as_deref(), Some("af_heart"));
+        assert_eq!(request.options.speed, Some(1.2));
+        assert!(Command::parse(&args(&["say", "--out", "a.wav"])).is_err());
+        assert!(Command::parse(&args(&["say", "hi"])).is_err());
+        assert!(Command::parse(&args(&["say", "hi", "--speed", "9", "--play"])).is_err());
+        assert_eq!(Command::parse(&args(&["tts"])), Ok(Command::Tts));
+    }
+
+    #[test]
+    fn says_to_a_file_with_the_given_backend() {
+        let dir = std::env::temp_dir().join(format!("phone-cli-say-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("hello.wav").to_string_lossy().into_owned();
+        let command = Command::parse(&args(&["say", "Hello.", "--out", &out])).unwrap();
+        let Output::Json(value) = execute_with(command, &fake).unwrap() else {
+            panic!("expected JSON");
+        };
+        assert_eq!(value["spoken"]["sample_rate"], 8_000);
+        assert_eq!(value["written"]["bytes"], 44 + 2 * 2_000);
+        assert_eq!(std::fs::metadata(&out).unwrap().len(), 44 + 4_000);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let Output::Json(info) = execute_with(Command::Tts, &fake).unwrap() else {
+            panic!("expected JSON");
+        };
+        assert_eq!(info["kind"], "fake");
+        // Unconfigured: the error says what to set.
+        let unconfigured = || Err("set PHONE_TTS_BASE_URL".to_string());
+        assert!(
+            execute_with(Command::Tts, &unconfigured)
+                .unwrap_err()
+                .contains("PHONE_TTS_BASE_URL")
+        );
+        // Commands that need no backend never ask for one.
+        assert!(execute_with(Command::Presets, &unconfigured).is_ok());
+    }
+
     #[cfg(not(feature = "speaker"))]
     #[test]
     fn playing_needs_the_speaker_feature() {
@@ -368,6 +682,8 @@ mod tests {
                 .contains("speaker")
         );
         assert!(run(&args(&["devices"])).unwrap_err().contains("speaker"));
+        let say = Command::parse(&args(&["say", "Hi.", "--play"])).unwrap();
+        assert!(execute_with(say, &fake).unwrap_err().contains("speaker"));
     }
 
     #[test]

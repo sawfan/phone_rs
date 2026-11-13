@@ -1,0 +1,23 @@
+[package]
+name = "phone-tts"
+version = "0.1.0"
+edition = "2024"
+description = "Text-to-speech for phone behind a backend-neutral interface, with speech streamed in pieces as the backend produces it."
+
+# Spelled out rather than inherited so the crate can also be a member of a
+# host workspace (Mnemosyne). Kept out of phone-core so the browser builds
+# (phone-leptos, phone-worklet) carry no HTTP client.
+[dependencies]
+phone-core = { path = "../phone-core" }
+schemars = { version = "1.0", optional = true }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "3.5.2", optional = true }
+
+[features]
+default = ["openai"]
+# JSON Schema derives for MCP request/response types.
+schema = ["dep:schemars"]
+# Backend for servers exposing the OpenAI speech API (Kokoro-FastAPI,
+# openedai-speech for Piper, LocalAI, OpenAI itself).
+openai = ["dep:ureq"]

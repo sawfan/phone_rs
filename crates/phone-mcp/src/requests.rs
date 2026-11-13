@@ -86,3 +86,27 @@ impl RenderTonesRequest {
         Sound::customized(preset, &changes)
     }
 }
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SayRequest {
+    /// What to say (at most 4,096 characters).
+    pub text: String,
+    /// Path of the WAV file to create on the machine running this server.
+    /// It must end in .wav and must not exist yet.
+    pub out: String,
+    /// A voice the speech backend knows; its configured voice when absent.
+    #[serde(default)]
+    pub voice: Option<String>,
+    /// Speaking speed, 0.25 to 4 (1 is normal).
+    #[serde(default)]
+    pub speed: Option<f64>,
+}
+
+impl SayRequest {
+    pub fn options(&self) -> phone_tts::SpeakOptions {
+        phone_tts::SpeakOptions {
+            voice: self.voice.clone(),
+            speed: self.speed,
+        }
+    }
+}

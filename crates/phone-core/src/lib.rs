@@ -13,15 +13,18 @@
 //!   and rendered with FunDSP oscillators and filters.
 //! - [`pcm`]: rendered samples ([`Pcm`]), level normalization, and WAV
 //!   encoding.
+//! - [`live`]: a real-time synthesizer driven by note commands (with a byte
+//!   encoding for passing them to an audio thread).
 //! - [`dto`]: results shared by adapters (the preset catalog, written
 //!   files).
 
 pub mod dto;
 pub mod formant;
 pub mod instrument;
+pub mod live;
 pub mod pcm;
 pub mod tone;
 
 pub use instrument::{Envelope, Preset, Sound, SoundChanges, Waveform};
-pub use pcm::Pcm;
+pub use pcm::{Pcm, Resampler};
 pub use tone::{Tone, ToneError};

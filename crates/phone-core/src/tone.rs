@@ -177,15 +177,29 @@ pub fn validate(tones: &[Tone]) -> Result<(), ToneError> {
     Ok(())
 }
 
-/// An oscillator of `waveform` at `hz` through the low-pass filter.
-fn voice(waveform: Waveform, hz: f32, cutoff_hz: f32) -> Box<dyn AudioUnit> {
-    let filter = || lowpass_hz(cutoff_hz, FILTER_Q);
-    match waveform {
+/// An oscillator of `waveform` at `hz` through the low-pass filter (its
+/// cutoff kept below [`MAX_CUTOFF_FRACTION`] of the rate), ready to run at
+/// `sample_rate`. Used for rendered tones and live voices alike.
+pub(crate) fn voice(
+    waveform: Waveform,
+    hz: f64,
+    cutoff_hz: f64,
+    sample_rate: f64,
+) -> Box<dyn AudioUnit> {
+    let (hz, cutoff) = (
+        hz as f32,
+        cutoff_hz.min(sample_rate * MAX_CUTOFF_FRACTION) as f32,
+    );
+    let filter = || lowpass_hz(cutoff, FILTER_Q);
+    let mut unit: Box<dyn AudioUnit> = match waveform {
         Waveform::Sine => Box::new(sine_hz(hz) >> filter()),
         Waveform::Triangle => Box::new(triangle_hz(hz) >> filter()),
         Waveform::Square => Box::new(square_hz(hz) >> filter()),
         Waveform::Sawtooth => Box::new(saw_hz(hz) >> filter()),
-    }
+    };
+    unit.set_sample_rate(sample_rate);
+    unit.reset();
+    unit
 }
 
 /// Renders `tones` played on `sound` at `volume` (0 to 1) as mono samples
@@ -229,11 +243,8 @@ pub fn render(
 
     let mut samples = vec![0.0_f32; (seconds * rate).ceil() as usize];
     let level = VOICE_LEVEL * volume / (peak_polyphony(tones).max(1) as f64).sqrt();
-    let cutoff = sound.cutoff_hz.min(rate * MAX_CUTOFF_FRACTION) as f32;
     for tone in tones {
-        let mut unit = voice(sound.waveform, tone.hz as f32, cutoff);
-        unit.set_sample_rate(rate);
-        unit.reset();
+        let mut unit = voice(sound.waveform, tone.hz, sound.cutoff_hz, rate);
         let first = (tone.start * rate).round() as usize;
         let length = ((tone.duration + release) * rate).ceil() as usize;
         let end = (first + length).min(samples.len());

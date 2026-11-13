@@ -1,0 +1,16 @@
+[package]
+name = "phone-worklet"
+version = "0.1.0"
+edition = "2024"
+description = "phone's live synthesizer as a small WebAssembly module for a browser AudioWorklet: plain exports, no imports, no wasm-bindgen."
+
+# Built for wasm32-unknown-unknown as its own module (see README): the
+# worklet runs on the audio thread, apart from the page's wasm. `rlib` keeps
+# the exports testable natively.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Spelled out rather than inherited so the crate can also be a member of a
+# host workspace (Mnemosyne).
+[dependencies]
+phone-core = { path = "../phone-core" }

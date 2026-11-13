@@ -15,7 +15,9 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         _ => {
-            eprintln!("usage: phone-mcp [serve|summary]");
+            eprintln!(
+                "usage: phone-mcp [serve|summary]   (text-to-speech configured by PHONE_TTS_* variables)"
+            );
             return ExitCode::FAILURE;
         }
     }

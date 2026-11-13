@@ -12,6 +12,7 @@ path = "src/main.rs"
 # host workspace (Mnemosyne).
 [dependencies]
 phone-core = { path = "../phone-core", features = ["schema"] }
+phone-tts = { path = "../phone-tts", features = ["schema"] }
 rmcp = { version = "3.5.1", features = ["transport-io"] }
 schemars = "1.0"
 serde = { version = "1.0.219", features = ["derive"] }

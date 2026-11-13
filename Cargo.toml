@@ -6,6 +6,8 @@ members = [
     "crates/phone-mcp",
     "crates/phone-leptos",
     "crates/phone-speaker",
+    "crates/phone-worklet",
+    "crates/phone-tts",
 ]
 
 [workspace.package]

@@ -6,8 +6,15 @@
 //! everything that plays sound on the page (rendered clips here, the music
 //! blocks' live voices in Mnemosyne) runs through [`with_context`].
 //!
-//! [`play`] plays a rendered [`Pcm`] clip; a new clip replaces the one
-//! playing. The browser resamples clips to the context's rate.
+//! [`play`] plays a rendered [`Pcm`] clip, replacing what is playing;
+//! [`enqueue`] plays one after the clips already queued, starting exactly
+//! where the last ends (gapless, for speech arriving a sentence at a time);
+//! [`stop`] stops them all. The browser resamples clips to the context's
+//! rate. [`live`]
+//! runs phone's synthesizer in an AudioWorklet for notes played as they
+//! happen.
+
+pub mod live;
 
 use std::cell::RefCell;
 
@@ -15,15 +22,28 @@ use phone_core::Pcm;
 use wasm_bindgen::JsValue;
 use web_sys::{AudioBufferSourceNode, AudioContext, AudioContextState, AudioScheduledSourceNode};
 
+/// How far ahead of the audio clock a clip that starts "now" is scheduled,
+/// so its first moments are not lost while the audio thread catches up.
+const START_LEAD_SECONDS: f64 = 0.02;
+
 #[derive(Default)]
 struct Audio {
     context: Option<AudioContext>,
-    /// The clip playing, stopped when the next starts.
-    clip: Option<AudioBufferSourceNode>,
+    /// Clips playing or waiting, with when each ends on the audio clock.
+    clips: Vec<(AudioBufferSourceNode, f64)>,
 }
 
 thread_local! {
     static AUDIO: RefCell<Audio> = RefCell::new(Audio::default());
+    /// How many times [`stop`] has run.
+    static STOPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times [`stop`] has run on this page. Code queueing clips over
+/// time (such as speech arriving a sentence at a time) notes it when it
+/// begins and gives up once it changes, whoever stopped the sound.
+pub fn stop_count() -> u64 {
+    STOPS.get()
 }
 
 /// A readable message from a browser exception.
@@ -83,36 +103,81 @@ pub fn with_context(
     });
 }
 
-/// Plays `pcm` now, stopping a clip already playing, and hands the outcome
-/// to `done` (an empty clip is an error). Call from a user gesture.
+/// Plays `pcm` now, stopping clips already playing or queued, and hands
+/// the outcome to `done` (an empty clip is an error). Call from a user
+/// gesture.
 pub fn play(pcm: Pcm, done: impl FnOnce(Result<(), String>) + 'static) {
     if pcm.samples.is_empty() {
         return done(Err("Nothing to play.".to_string()));
     }
     with_context(
-        move |context| start_clip(context, &pcm).map_err(js_message),
+        move |context| {
+            stop();
+            schedule_clip(context, &pcm, false).map_err(js_message)
+        },
         done,
     );
 }
 
-fn start_clip(context: &AudioContext, pcm: &Pcm) -> Result<(), JsValue> {
+/// Plays `pcm` once the clips already queued have played (now, if none
+/// is left), with no gap between them, and hands the outcome to `done`.
+/// The first clip of a sequence must come from a user gesture, or after
+/// one has started the audio context.
+pub fn enqueue(pcm: Pcm, done: impl FnOnce(Result<(), String>) + 'static) {
+    if pcm.samples.is_empty() {
+        return done(Err("Nothing to play.".to_string()));
+    }
+    with_context(
+        move |context| schedule_clip(context, &pcm, true).map_err(js_message),
+        done,
+    );
+}
+
+/// When the queued clips end on the audio clock, if any are left.
+pub fn queued_until() -> Option<f64> {
+    let now = context()?.current_time();
+    AUDIO.with_borrow(|audio| {
+        audio
+            .clips
+            .iter()
+            .map(|(_, end)| *end)
+            .fold(None, |latest: Option<f64>, end| {
+                Some(latest.map_or(end, |l| l.max(end)))
+            })
+            .filter(|end| *end > now)
+    })
+}
+
+fn schedule_clip(context: &AudioContext, pcm: &Pcm, after_queue: bool) -> Result<(), JsValue> {
     let buffer = context.create_buffer(1, pcm.samples.len() as u32, pcm.sample_rate as f32)?;
     buffer.copy_to_channel(&pcm.samples, 0)?;
     let source = context.create_buffer_source()?;
     source.set_buffer(Some(&buffer));
     source.connect_with_audio_node(&context.destination())?;
-    source.start()?;
-    let previous = AUDIO.with_borrow_mut(|audio| audio.clip.replace(source));
-    if let Some(previous) = previous {
-        // Stopping a clip that already ended is allowed and does nothing.
-        let _ = AudioScheduledSourceNode::stop(&previous);
-    }
+    let now = context.current_time();
+    let start = AUDIO.with_borrow_mut(|audio| {
+        // Forget clips that have finished.
+        audio.clips.retain(|(_, end)| *end > now);
+        let queued = audio.clips.iter().map(|(_, end)| *end).fold(0.0, f64::max);
+        let soonest = now + START_LEAD_SECONDS;
+        if after_queue {
+            queued.max(soonest)
+        } else {
+            soonest
+        }
+    });
+    source.start_with_when(start)?;
+    let end = start + buffer.duration();
+    AUDIO.with_borrow_mut(|audio| audio.clips.push((source, end)));
     Ok(())
 }
 
-/// Stops the clip playing, if any.
+/// Stops every clip playing or queued.
 pub fn stop() {
-    if let Some(clip) = AUDIO.with_borrow_mut(|audio| audio.clip.take()) {
+    STOPS.set(STOPS.get() + 1);
+    let clips = AUDIO.with_borrow_mut(|audio| std::mem::take(&mut audio.clips));
+    for (clip, _) in clips {
+        // Stopping a clip that already ended is allowed and does nothing.
         let _ = AudioScheduledSourceNode::stop(&clip);
     }
 }

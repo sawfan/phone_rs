@@ -53,7 +53,7 @@ impl ServerHandler for PhoneMcpServer {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("phone-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Use the phone tools to render notes (frequencies with start times and durations) to WAV files with preset or customized sounds, and to list the presets.",
+                "Use the phone tools to render notes (frequencies with start times and durations) to WAV files with preset or customized sounds, to list the presets, and to say text with the configured text-to-speech backend.",
             )
     }
 }
@@ -73,11 +73,43 @@ mod tests {
     fn lists_its_tools() {
         assert_eq!(
             PhoneMcpServer::tool_names().len(),
-            2,
+            4,
             "{:?}",
             PhoneMcpServer::tool_names()
         );
         assert!(PhoneMcpServer::tool_names().contains(&"phone.render_tones".to_string()));
+    }
+
+    #[tokio::test]
+    async fn say_checks_the_file_before_asking_the_backend() {
+        let dir = std::env::temp_dir().join(format!("phone-mcp-say-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let taken = dir.join("taken.wav");
+        std::fs::write(&taken, b"x").unwrap();
+        let request: crate::requests::SayRequest = serde_json::from_value(serde_json::json!({
+            "text": "Hello.",
+            "out": taken.to_string_lossy()
+        }))
+        .unwrap();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&asked);
+        let error = crate::tools::say(
+            move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err("no backend".to_string())
+            },
+            request,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+        // Unconfigured, the error says so.
+        let error = crate::tools::tts_backend(|| Err("set PHONE_TTS_BASE_URL".to_string()))
+            .await
+            .unwrap_err();
+        assert!(error.contains("PHONE_TTS_BASE_URL"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
